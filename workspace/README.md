@@ -226,11 +226,68 @@ python3 -m pwncorpus.attest check  snap.json --prefix ABCDE
 - **从最后链项继续**：`ledger-replay --intents claims.jsonl` 批量追加；已在链上的声明跳过为 duplicate，崩溃后用同一文件重放即从断点继续。
 - **并行写入不分叉**：写事务 `BEGIN IMMEDIATE` 串行化，并以单行 `ledger_head` 的**条件更新**（`WHERE head_seq/head_hash = 所观察的前驱`）做原子 compare-and-set。SQLite WAL 下排队等待写锁的连接可能持有等待前的读快照（即使已拿到写锁）；CAS 影响 0 行即暴露陈旧快照，回滚重试，哈希链因此永不分叉。
 
+## 按调用方隔离的隐私预算
+
+匿名前缀读取在原有发布版本之上增加按调用方隔离的 UTC 日预算。初始化后，`GET /api/range/{prefix}` 必须携带预算令牌；未初始化预算的旧部署仍保持原有匿名行为，便于灰度。
+
+### 持久状态与事务
+
+- 每个调用方、每个 UTC 日历日一行，可变预算状态严格为：`tenant_id`、`window_start`、`remaining`、`spent`、`frozen`、`policy_revision`。
+- 窗口在 UTC `00:00` 滚动，不读取本机时区。冻结是调用方状态，会延续到新 UTC 日；消费与追加额度绝不跨日。
+- 查询在单个 SQLite `BEGIN IMMEDIATE` 事务内完成：条件扣减（`remaining>0 AND frozen=0`）→ 写入 `consume` 审计事件 → 读取正文 → 提交。桶不存在也同样扣减并返回 404，因此不能用限流结果探测桶是否存在。
+- 成功返回 200 或正文性 404；冻结返回 403，耗尽返回 429。响应体只给通用错误，不回显调用方以外状态；响应头返回本次扣减后的本调用方余额、累计消费、UTC 窗口、冻结标记和策略版本。
+- `budget_events` 为追加式哈希链；链头单行 CAS 与写锁共同序列化并行请求。SQLite `CHECK (remaining >= 0)`、条件更新和同事务事件提交保证崩溃后无负数、无双扣、无半条冻结记录。
+- 同一请求两枚令牌时，在同一写事务中比较双方：冻结优先于未冻结，否则选择 `remaining` 更少者；撤销令牌在事务开始后即无法消费。
+
+### 初始化、令牌与管理入口
+
+```bash
+python3 -m pwncorpus.cli --db corpus.db budget-init --daily-quota 100 --key budget-genesis.key
+python3 -m pwncorpus.cli --db corpus.db budget-token --tenant tenant-001 --label api-client
+python3 -m pwncorpus.cli --db corpus.db budget-revoke --token pwb_...
+python3 -m pwncorpus.cli --db corpus.db budget-grant  --tenant tenant-001 --amount 20
+python3 -m pwncorpus.cli --db corpus.db budget-freeze  --tenant tenant-001
+python3 -m pwncorpus.cli --db corpus.db budget-unfreeze --tenant tenant-001
+python3 -m pwncorpus.cli --db corpus.db budget-get --tenant tenant-001
+```
+
+HTTP 查询使用 `X-Budget-Token: <token>`；两枚令牌用逗号分隔的 `X-Budget-Tokens: t1,t2`。管理 API 需要原有令牌体系中的 `budget_admin` 作用域：
+
+| 端点 | 作用 |
+|---|---|
+| `POST /api/admin/budget-tokens` | 为 `tenant_id` 签发预算令牌；令牌只显示一次，库中只存 SHA-256 |
+| `POST /api/admin/budget-tokens/revoke` | 撤销一枚预算令牌 |
+| `POST /api/admin/budgets/grant` | 为单个调用方当前 UTC 日追加额度 |
+| `POST /api/admin/budgets/{tenant}/freeze` / `unfreeze` | 冻结或解冻调用方 |
+| `GET /api/admin/budgets/{tenant}` | 查询本调用方窗口及审计事件重算计数 |
+
+追加额度、冻结、解冻都会产生不可变事件并推进该窗口的 `policy_revision`；新策略不会改写已导出的历史目录，旧导出也不能覆盖新目录。
+
+### 隔离审计导出与断网校验
+
+```bash
+# 独立审计进程：只读数据库，先完整重放哈希链，再原子生成签名目录
+python3 -m pwncorpus.cli --db corpus.db budget-export --key budget-genesis.key --out budget-2026-10-06 --window 2026-10-06
+
+# 断网机器：移走 corpus.db 后仍可校验；模块不导入数据库驱动
+python3 -m pwncorpus.budgetverify verify budget-2026-10-06
+python3 -m pwncorpus.budgetverify check budget-2026-10-06 --tenant tenant-001 --ordinal 37
+```
+
+导出目录包含 `manifest.json`、`audit_data.json`、`capacity_data.json`：
+
+- `audit_data.json` 只含调用方编号、UTC 时间窗、扣减次数和失败原因（`frozen` / `budget_exhausted`），没有前缀、后缀、完整指纹、令牌或原始口令。
+- `capacity_data.json` 单独承载审计重算所需的初始日额度与追加次数；两部分 SHA-256 均钉入清单。
+- 清单自哈希后由预算 genesis Ed25519 私钥签名；断网校验器重算清单自哈希、签名、两部分摘要、行集合、额度公式和每日余额：`capacity = initial_quota + grants`、`remaining = capacity - deducted`。
+- 篡改任何计数、追加记录、冻结标记或摘要都会失败；导出目录脱离服务后仍可复算每日余额。管理端计数与导出行逐项相加一致。
+
 ## 测试
 
 ```bash
 python3 -m unittest discover -s tests -v
 ```
 
-87 个用例覆盖：原有 46 个（摄取/发布/导出/增量，行为不变），以及责任账本：链项哈希与 prev_hash 链接、来源注册与验签、伪造签名与未注册来源拒绝、只能撤回/纠错本人提交、撤回理由与摘要绑定、重复提交/幂等键返回原记录、双撤回幂等、链项删除即断链、存储哈希篡改检测、`--expect-head` 并行冲突、断点重放跳过已追加项、8 线程同声明唯一胜出、不同声明无间隙串行、高并发下链永不分叉（多轮回归）、纠错先于/后于撤回的标记、快照自哈希/genesis 签名/TTL 过期、`--as-of` 时间点截断、责任记录与链项签名篡改检测、缺失链项、genesis 公钥钉扎不符、旧快照不得覆盖较新状态（同 head 可续期）、错误 genesis 密钥拒绝、离线核验的提交/撤回时间/纠错先后判定、仅前缀查询不泄露其他指纹、摘要不符与来源权限的明确失败、失败信息不含桶内容、以及三边界全部经真实子进程（CLI 写入→独立 audit 导出→无数据库 attest 核验，含移走 DB 后仍可核验），并验证账本与现有摄取/构建/激活/导出流水线共存不变。
+105 个用例覆盖：原有摄取/发布/导出/增量回归，以及按调用方隔离的隐私预算：首次开窗与原子扣减、桶不存在仍扣减、重复/并行请求不双扣、重启恢复剩余额度和冻结状态、耗尽 429、冻结 403、令牌撤销、两枚令牌按更严格额度消费、UTC 日窗口切换、追加额度与策略版本、管理端计数与导出逐项一致、伪造导出物、文件摘要不符、存储事件哈希篡改、冻结跨日重放、导出物不含前缀/后缀/原始口令/令牌，以及 CLI 写入→独立审计导出→移走数据库后断网校验的真实子进程边界。
+
+责任账本覆盖：链项哈希与 prev_hash 链接、来源注册与验签、伪造签名与未注册来源拒绝、只能撤回/纠错本人提交、撤回理由与摘要绑定、重复提交/幂等键返回原记录、双撤回幂等、链项删除即断链、存储哈希篡改检测、`--expect-head` 并行冲突、断点重放跳过已追加项、8 线程同声明唯一胜出、不同声明无间隙串行、高并发下链永不分叉（多轮回归）、纠错先于/后于撤回的标记、快照自哈希/genesis 签名/TTL 过期、`--as-of` 时间点截断、责任记录与链项签名篡改检测、缺失链项、genesis 公钥钉扎不符、旧快照不得覆盖较新状态（同 head 可续期）、错误 genesis 密钥拒绝、离线核验的提交/撤回时间/纠错先后判定、仅前缀查询不泄露其他指纹、摘要不符与来源权限的明确失败、失败信息不含桶内容、以及三边界全部经真实子进程（CLI 写入→独立 audit 导出→无数据库 attest 核验，含移走 DB 后仍可核验），并验证账本与现有摄取/构建/激活/导出流水线共存不变。
 

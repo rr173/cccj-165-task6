@@ -22,6 +22,7 @@ import os
 import sys
 
 from . import audit, attest, core, db, delta, ledger, verifier
+from . import budget, budgetaudit, budgetverify
 from . import ed25519
 import hashlib as _hashlib
 
@@ -40,7 +41,67 @@ def main(argv=None) -> int:
     p = sub.add_parser("token", help="create an API token (shown once)")
     p.add_argument("--label", required=True)
     p.add_argument("--scopes", required=True,
-                   help="comma separated: ingest,retract,publish")
+                   help="comma separated: ingest,retract,publish,budget_admin")
+
+    # ---- per-caller privacy budget --------------------------------------
+    p = sub.add_parser("budget-init",
+                       help="initialise per-tenant daily privacy budgets")
+    p.add_argument("--daily-quota", dest="daily_quota", type=int,
+                   default=budget.DEFAULT_DAILY_QUOTA)
+    p.add_argument("--key", required=True, help="budget genesis private key (0600)")
+
+    p = sub.add_parser("budget-token",
+                       help="issue a token for one privacy-budget tenant")
+    p.add_argument("--tenant", required=True)
+    p.add_argument("--label", default="")
+
+    p = sub.add_parser("budget-revoke", help="revoke one caller budget token")
+    p.add_argument("--token", required=True)
+
+    p = sub.add_parser("budget-grant", help="append quota to a tenant's UTC day")
+    p.add_argument("--tenant", required=True)
+    p.add_argument("--amount", type=int, required=True)
+    p.add_argument("--window", default=None, help="must be the current UTC date")
+
+    p = sub.add_parser("budget-freeze", help="freeze a tenant's budget token access")
+    p.add_argument("--tenant", required=True)
+
+    p = sub.add_parser("budget-unfreeze", help="unfreeze a tenant")
+    p.add_argument("--tenant", required=True)
+
+    p = sub.add_parser("budget-get", help="show one tenant/window budget state")
+    p.add_argument("--tenant", required=True)
+    p.add_argument("--window", default=None)
+
+    p = sub.add_parser("budget-list", help="list budget states for one UTC window")
+    p.add_argument("--window", default=None)
+
+    p = sub.add_parser("budget-export",
+                       help="independent read-only audit export for a UTC day")
+    p.add_argument("--key", required=True, help="budget genesis private key")
+    p.add_argument("--out", required=True)
+    p.add_argument("--window", default=None)
+    p.add_argument("--now", default=None)
+    p.add_argument("--genesis-pub", default=None)
+
+    p = sub.add_parser("budget-verify-db",
+                       help="verify stored budget chain without exporting")
+    p.add_argument("--window", default=None)
+
+    p = sub.add_parser("budget-verify",
+                       help="offline verify a detached budget export (no DB)")
+    p.add_argument("export_dir")
+    p.add_argument("--genesis-pub", default=None)
+    p.add_argument("--json", action="store_true")
+
+    p = sub.add_parser("budget-check",
+                       help="offline decide whether request ordinal was in budget")
+    p.add_argument("export_dir")
+    p.add_argument("--tenant", required=True)
+    p.add_argument("--ordinal", type=int, required=True)
+    p.add_argument("--window", default=None)
+    p.add_argument("--genesis-pub", default=None)
+    p.add_argument("--json", action="store_true")
 
     p = sub.add_parser("ingest", help="ingest a batch file (one password or "
                        "'sha1:<hex>' per line)")
@@ -175,6 +236,85 @@ def main(argv=None) -> int:
             token = core.create_token(conn, args.label, args.scopes.split(","))
             print(f"token (store it now, it is not recoverable): {token}")
             return 0
+
+        # ---- privacy budget handlers ------------------------------------
+        if args.cmd == "budget-init":
+            info = budget.initialise(conn, args.daily_quota, args.key)
+            print(json.dumps(info, indent=2, sort_keys=True))
+            return 0
+
+        if args.cmd == "budget-token":
+            print(budget.create_token(conn, args.tenant, args.label))
+            return 0
+
+        if args.cmd == "budget-revoke":
+            print(json.dumps(budget.revoke_token(conn, args.token), indent=2,
+                             sort_keys=True))
+            return 0
+
+        if args.cmd == "budget-grant":
+            print(json.dumps(budget.grant(conn, args.tenant, args.amount,
+                                          window=args.window),
+                             indent=2, sort_keys=True))
+            return 0
+
+        if args.cmd == "budget-freeze":
+            print(json.dumps(budget.freeze(conn, args.tenant), indent=2,
+                             sort_keys=True))
+            return 0
+
+        if args.cmd == "budget-unfreeze":
+            print(json.dumps(budget.unfreeze(conn, args.tenant), indent=2,
+                             sort_keys=True))
+            return 0
+
+        if args.cmd == "budget-get":
+            print(json.dumps(budget.get_window(conn, args.tenant, args.window),
+                             indent=2, sort_keys=True))
+            return 0
+
+        if args.cmd == "budget-list":
+            print(json.dumps(budget.list_windows(conn, args.window),
+                             indent=2, sort_keys=True))
+            return 0
+
+        if args.cmd == "budget-verify-db":
+            result = budgetaudit.verify(args.db)
+            print(json.dumps({
+                "budget_id": result["budget_id"],
+                "head_seq": result["head_seq"],
+                "head_hash": result["head_hash"],
+                "initial_daily_quota": result["initial_daily_quota"],
+                "policy_revision": result["policy_revision"],
+                "windows": len(result["windows"]),
+            }, indent=2, sort_keys=True))
+            return 0
+
+        if args.cmd == "budget-export":
+            manifest = budgetaudit.export_budget(
+                args.db, args.key, args.out, args.window,
+                created_at=args.now, genesis_pub_pin=args.genesis_pub)
+            print(json.dumps(manifest, indent=2, sort_keys=True))
+            return 0
+
+        if args.cmd == "budget-verify":
+            verified = budgetverify.verify_export(
+                args.export_dir, trusted_genesis_pub=args.genesis_pub)
+            if args.json:
+                print(json.dumps(verified, indent=2, sort_keys=True))
+            else:
+                print(f"OK: budget export {verified['manifest']['budget_id']},"
+                      f" {len(verified['rows'])} tenant rows, window"
+                      f" {verified['manifest']['window_start']}")
+            return 0
+
+        if args.cmd == "budget-check":
+            verified = budgetverify.verify_export(
+                args.export_dir, trusted_genesis_pub=args.genesis_pub)
+            verdict = budgetverify.check_request(
+                verified, args.tenant, args.ordinal, window=args.window)
+            print(json.dumps(verdict, indent=2, sort_keys=True))
+            return 0 if verdict["verdict"] == "within_budget" else 3
 
         if args.cmd == "ingest":
             items = []
@@ -366,6 +506,15 @@ def main(argv=None) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     except ledger.LedgerError as exc:
+        print(f"FAIL: {exc}", file=sys.stderr)
+        return 1
+    except budgetaudit.BudgetAuditError as exc:
+        print(f"FAIL: {exc}", file=sys.stderr)
+        return 1
+    except budget.BudgetError as exc:
+        print(f"FAIL: {exc}", file=sys.stderr)
+        return 1
+    except budgetverify.BudgetVerifyError as exc:
         print(f"FAIL: {exc}", file=sys.stderr)
         return 1
     finally:

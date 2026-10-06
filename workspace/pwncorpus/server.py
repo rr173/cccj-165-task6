@@ -13,7 +13,7 @@ import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-from . import core, db
+from . import budget, core, db
 
 MAX_BODY = 256 * 1024 * 1024  # 256 MiB request cap
 
@@ -85,6 +85,40 @@ def make_server(db_path: str, host: str, port: int) -> ThreadingHTTPServer:
                 return None
             return row
 
+        def _budget_tokens(self):
+            raw = self.headers.get("X-Budget-Tokens") or \
+                self.headers.get("X-Budget-Token")
+            if raw:
+                parts = [p.strip() for p in raw.split(",") if p.strip()]
+            else:
+                auth = self.headers.get("Authorization", "")
+                # Up to two comma-separated Bearer tokens are accepted.
+                parts = [p.strip()[7:].strip() for p in auth.split(",")
+                         if p.strip().startswith("Bearer ")] if auth else []
+            # Deduplicate exact repeated credentials while preserving order.
+            return list(dict.fromkeys(parts))
+
+        def _budget_headers(self, state):
+            return {
+                "X-Budget-Remaining": str(state["remaining"]),
+                "X-Budget-Spent": str(state["spent"]),
+                "X-Budget-Window-Start": state["window_start"],
+                "X-Budget-Reset": state["reset_at"],
+                "X-Budget-Policy-Revision": str(state["policy_revision"]),
+                "X-Budget-Frozen": "true" if state["frozen"] else "false",
+            }
+
+        def _budget_denied(self, denied: budget.BudgetDenied):
+            # Generic bodies: no tenant id and no indication whether the
+            # requested prefix exists in the active corpus.
+            state = denied.state
+            if denied.reason == budget.REASON_FROZEN:
+                msg = "request forbidden"
+            else:
+                msg = "rate limit exceeded"
+            return self._json(denied.status, {"error": msg},
+                              headers=self._budget_headers(state))
+
         # -- routing -------------------------------------------------------
         def do_GET(self):
             path = urlparse(self.path).path
@@ -95,7 +129,13 @@ def make_server(db_path: str, host: str, port: int) -> ThreadingHTTPServer:
                                             "active_version": core.current_version(conn)})
                 m = re.fullmatch(r"/api/range/([^/]+)", path)
                 if m:
-                    return self._range(conn, m.group(1))
+                    return self._budget_range(conn, m.group(1))
+                m = re.fullmatch(r"/api/admin/budgets/([A-Za-z0-9_.:-]+)", path)
+                if m:
+                    if not self._require(conn, "budget_admin"):
+                        return
+                    return self._json(200, {"budget":
+                                            budget.get_window(conn, m.group(1))})
                 if path == "/api/publications":
                     if not self._require(conn, "publish"):
                         return
@@ -114,6 +154,14 @@ def make_server(db_path: str, host: str, port: int) -> ThreadingHTTPServer:
                         return
                     return self._review_page(conn)
                 return self._error(404, "not found")
+            except budget.BudgetDenied as exc:
+                return self._budget_denied(exc)
+            except budget.BudgetAuth as exc:
+                return self._error(401, str(exc))
+            except budget.BudgetNotInitialised as exc:
+                return self._error(503, "privacy budget service unavailable")
+            except budget.BudgetError as exc:
+                return self._error(400, str(exc))
             except core.CorpusError as exc:
                 return self._error(400, str(exc))
             except BrokenPipeError:  # client went away
@@ -161,6 +209,38 @@ def make_server(db_path: str, host: str, port: int) -> ThreadingHTTPServer:
                     if not self._require(conn, "publish"):
                         return
                     return self._json(200, core.refresh_candidate(conn, int(m.group(1))))
+                if path == "/api/admin/budget-tokens":
+                    if not self._require(conn, "budget_admin"):
+                        return
+                    payload = self._body_json()
+                    token = budget.create_token(
+                        conn, payload.get("tenant_id"),
+                        payload.get("label", ""))
+                    return self._json(201, {"token": token})
+                m = re.fullmatch(r"/api/admin/budget-tokens/revoke", path)
+                if m:
+                    if not self._require(conn, "budget_admin"):
+                        return
+                    payload = self._body_json()
+                    return self._json(200,
+                                      budget.revoke_token(conn, payload.get("token", "")))
+                if path == "/api/admin/budgets/grant":
+                    if not self._require(conn, "budget_admin"):
+                        return
+                    payload = self._body_json()
+                    amount = payload.get("amount")
+                    if not isinstance(amount, int) or isinstance(amount, bool):
+                        return self._error(400, "amount must be an integer")
+                    return self._json(200, budget.grant(
+                        conn, payload.get("tenant_id"), amount,
+                        window=payload.get("window")))
+                m = re.fullmatch(r"/api/admin/budgets/([A-Za-z0-9_.:-]+)/(freeze|unfreeze)", path)
+                if m:
+                    if not self._require(conn, "budget_admin"):
+                        return
+                    action = budget.freeze if m.group(2) == "freeze" \
+                        else budget.unfreeze
+                    return self._json(200, action(conn, m.group(1)))
                 if path == "/review/activate":
                     return self._review_activate(conn)
                 if path == "/review/refresh":
@@ -170,6 +250,14 @@ def make_server(db_path: str, host: str, port: int) -> ThreadingHTTPServer:
                 return self._error(404, str(exc))
             except core.Conflict as exc:
                 return self._error(409, str(exc))
+            except budget.BudgetDenied as exc:
+                return self._budget_denied(exc)
+            except budget.BudgetAuth as exc:
+                return self._error(401, str(exc))
+            except budget.BudgetNotInitialised as exc:
+                return self._error(503, "privacy budget service unavailable")
+            except budget.BudgetError as exc:
+                return self._error(400, str(exc))
             except core.CorpusError as exc:
                 return self._error(400, str(exc))
             except BrokenPipeError:
@@ -187,6 +275,29 @@ def make_server(db_path: str, host: str, port: int) -> ThreadingHTTPServer:
                 return self._json(404, {"error": "prefix not found"}, headers=hdr)
             hdr["Cache-Control"] = "public, max-age=60"
             return self._send(200, body, "text/plain; charset=utf-8", hdr)
+
+        def _budget_range(self, conn, prefix):
+            # Existing deployments retain the legacy anonymous endpoint until
+            # an administrator explicitly initialises caller budgets.
+            if not budget.is_initialised(conn):
+                return self._range(conn, prefix)
+            tokens = self._budget_tokens()
+            result = budget.consume_query(conn, tokens, prefix)
+            if result.get("status") == 503:
+                return self._error(503, "no active publication")
+            hdr = {
+                "X-Corpus-Version": str(result["version"]),
+                "X-Budget-Event-Seq": str(result["event_seq"]),
+                **self._budget_headers(result),
+            }
+            # The deduction has already committed; this 404 intentionally uses
+            # the same rate state as a returned bucket, so exhausting quota
+            # does not reveal whether the tested bucket exists.
+            hdr["Cache-Control"] = "no-store"
+            if result["body"] is None:
+                return self._json(404, {"error": "prefix not found"},
+                                  headers=hdr)
+            return self._send(200, result["body"], "text/plain; charset=utf-8", hdr)
 
         def _ingest(self, conn):
             payload = self._body_json()

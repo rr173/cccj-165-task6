@@ -74,8 +74,110 @@ CREATE TABLE IF NOT EXISTS meta (
 CREATE TABLE IF NOT EXISTS tokens (
   token_sha256  TEXT PRIMARY KEY,                   -- only the hash of the token is stored
   label         TEXT NOT NULL,
-  scopes        TEXT NOT NULL,                      -- comma separated: ingest,retract,publish
+  scopes        TEXT NOT NULL,                      -- comma separated scopes
   created_at    TEXT NOT NULL
+);
+
+-- Per-tenant UTC daily budget windows.  A tenant's mutable quota state is
+-- exactly these six columns; corpus prefixes/suffixes are never stored here.
+CREATE TABLE IF NOT EXISTS budget_windows (
+  tenant_id       TEXT NOT NULL,
+  window_start    TEXT NOT NULL,                   -- UTC midnight, ISO-8601
+  remaining       INTEGER NOT NULL CHECK (remaining >= 0),
+  spent           INTEGER NOT NULL CHECK (spent >= 0),
+  frozen          INTEGER NOT NULL CHECK (frozen IN (0, 1)),
+  policy_revision INTEGER NOT NULL CHECK (policy_revision >= 1),
+  PRIMARY KEY (tenant_id, window_start)
+);
+
+CREATE TABLE IF NOT EXISTS budget_tokens (
+  token_sha256  TEXT PRIMARY KEY,
+  tenant_id     TEXT NOT NULL,
+  label         TEXT NOT NULL,
+  revoked       INTEGER NOT NULL DEFAULT 0 CHECK (revoked IN (0, 1)),
+  created_at    TEXT NOT NULL,
+  revoked_at    TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_budget_tokens_tenant
+  ON budget_tokens(tenant_id, revoked);
+
+-- Append-only, hash-chained budget audit trail.  Rows identify only the
+-- tenant and UTC day; no queried prefix, suffix or raw secret is permitted.
+CREATE TABLE IF NOT EXISTS budget_events (
+  seq              INTEGER PRIMARY KEY AUTOINCREMENT,
+  tenant_id        TEXT NOT NULL,
+  window_start     TEXT NOT NULL,
+  kind             TEXT NOT NULL CHECK (kind IN
+                     ('consume','deny','grant','freeze','unfreeze')),
+  count            INTEGER NOT NULL CHECK (count >= 0),
+  reason           TEXT NOT NULL DEFAULT '',
+  created_at       TEXT NOT NULL,
+  policy_revision  INTEGER NOT NULL,
+  prev_hash        TEXT NOT NULL,
+  event_hash       TEXT NOT NULL UNIQUE
+);
+CREATE INDEX IF NOT EXISTS idx_budget_events_window
+  ON budget_events(tenant_id, window_start, kind);
+
+CREATE TABLE IF NOT EXISTS budget_head (
+  id         INTEGER PRIMARY KEY CHECK (id = 1),
+  head_seq   INTEGER NOT NULL,
+  head_hash  TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS budget_policy (
+  id                 INTEGER PRIMARY KEY CHECK (id = 1),
+  initial_daily_quota INTEGER NOT NULL CHECK (initial_daily_quota >= 0),
+  policy_revision    INTEGER NOT NULL CHECK (policy_revision >= 1),
+  created_at         TEXT NOT NULL
+);
+"""
+
+BUDGET_SCHEMA = """
+CREATE TABLE IF NOT EXISTS budget_windows (
+  tenant_id       TEXT NOT NULL,
+  window_start    TEXT NOT NULL,
+  remaining       INTEGER NOT NULL CHECK (remaining >= 0),
+  spent           INTEGER NOT NULL CHECK (spent >= 0),
+  frozen          INTEGER NOT NULL CHECK (frozen IN (0, 1)),
+  policy_revision INTEGER NOT NULL CHECK (policy_revision >= 1),
+  PRIMARY KEY (tenant_id, window_start)
+);
+CREATE TABLE IF NOT EXISTS budget_tokens (
+  token_sha256  TEXT PRIMARY KEY,
+  tenant_id     TEXT NOT NULL,
+  label         TEXT NOT NULL,
+  revoked       INTEGER NOT NULL DEFAULT 0 CHECK (revoked IN (0, 1)),
+  created_at    TEXT NOT NULL,
+  revoked_at    TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_budget_tokens_tenant
+  ON budget_tokens(tenant_id, revoked);
+CREATE TABLE IF NOT EXISTS budget_events (
+  seq              INTEGER PRIMARY KEY AUTOINCREMENT,
+  tenant_id        TEXT NOT NULL,
+  window_start     TEXT NOT NULL,
+  kind             TEXT NOT NULL CHECK (kind IN
+                     ('consume','deny','grant','freeze','unfreeze')),
+  count            INTEGER NOT NULL CHECK (count >= 0),
+  reason           TEXT NOT NULL DEFAULT '',
+  created_at       TEXT NOT NULL,
+  policy_revision  INTEGER NOT NULL,
+  prev_hash        TEXT NOT NULL,
+  event_hash       TEXT NOT NULL UNIQUE
+);
+CREATE INDEX IF NOT EXISTS idx_budget_events_window
+  ON budget_events(tenant_id, window_start, kind);
+CREATE TABLE IF NOT EXISTS budget_head (
+  id         INTEGER PRIMARY KEY CHECK (id = 1),
+  head_seq   INTEGER NOT NULL,
+  head_hash  TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS budget_policy (
+  id                 INTEGER PRIMARY KEY CHECK (id = 1),
+  initial_daily_quota INTEGER NOT NULL CHECK (initial_daily_quota >= 0),
+  policy_revision    INTEGER NOT NULL CHECK (policy_revision >= 1),
+  created_at         TEXT NOT NULL
 );
 """
 
