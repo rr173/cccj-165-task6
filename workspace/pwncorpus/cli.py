@@ -22,6 +22,7 @@ import os
 import sys
 
 from . import audit, attest, core, db, delta, ledger, verifier
+from . import budget, budgetaudit
 from . import ed25519
 import hashlib as _hashlib
 
@@ -84,6 +85,58 @@ def main(argv=None) -> int:
     p.add_argument("--out", required=True, help="output delta package directory")
 
     p = sub.add_parser("status", help="show publications and batch stats")
+
+    # ---- per-caller privacy budget (additive; the range endpoint stays
+    #      anonymous until budget-init is run) ------------------------------
+    p = sub.add_parser("budget-init",
+                       help="initialise per-caller privacy budgets and create"
+                            " the budget genesis signing key")
+    p.add_argument("--key", required=True, help="where to write the budget"
+                                                " genesis key file (mode 0600)")
+    p.add_argument("--daily-quota", dest="daily_quota", type=int,
+                   default=budget.DEFAULT_DAILY_QUOTA,
+                   help="fixed per-tenant UTC-day quota for policy revision 1")
+
+    p = sub.add_parser("budget-policy",
+                       help="append a new default daily-quota policy revision"
+                            " (existing windows keep their old revision)")
+    p.add_argument("--daily-quota", dest="daily_quota", type=int, required=True)
+
+    p = sub.add_parser("budget-token",
+                       help="issue a query token for a tenant (shown once)")
+    p.add_argument("--tenant", required=True)
+    p.add_argument("--label", required=True)
+
+    p = sub.add_parser("budget-revoke", help="revoke a query token by token id")
+    p.add_argument("--token-id", dest="token_id", required=True)
+
+    p = sub.add_parser("budget-topup",
+                       help="add quota units to a tenant's current UTC window")
+    p.add_argument("--tenant", required=True)
+    p.add_argument("--amount", type=int, required=True)
+    p.add_argument("--note", default="")
+
+    p = sub.add_parser("budget-freeze", help="freeze a tenant (no body served)")
+    p.add_argument("--tenant", required=True)
+
+    p = sub.add_parser("budget-unfreeze", help="unfreeze a tenant")
+    p.add_argument("--tenant", required=True)
+
+    p = sub.add_parser("budget-status",
+                       help="show tenants and per-window budget counts")
+    p.add_argument("--tenant", default=None)
+    p.add_argument("--window", default=None,
+                   help="UTC date YYYY-MM-DD (default: all windows)")
+
+    p = sub.add_parser("budget-export",
+                       help="independent auditor: verify the budget and write a"
+                            " signed export for the offline verifier")
+    p.add_argument("--key", required=True, help="budget genesis key file")
+    p.add_argument("--out", required=True)
+    p.add_argument("--as-of", dest="as_of", default=None)
+    p.add_argument("--previous", default=None)
+    p.add_argument("--now", default=None)
+    p.add_argument("--overwrite", action="store_true")
 
     # ---- provenance responsibility ledger (additive; existing commands
     #      above are unchanged) -------------------------------------------
@@ -157,6 +210,20 @@ def main(argv=None) -> int:
     if args.cmd == "init":
         db.init(args.db)
         print(f"initialised {args.db}")
+        return 0
+
+    if args.cmd == "budget-init":
+        conn = _conn(args)
+        try:
+            info = budget.initialise(conn, args.key,
+                                     daily_quota=args.daily_quota)
+            print(f"budget initialised: id {info['budget_id']}, policy"
+                  f" revision {info['policy_revision']}, daily quota"
+                  f" {info['daily_quota']}")
+            print(f"budget genesis public key: {info['genesis_pub']}")
+            print(f"genesis private key written (0600) to {info['key_file']}")
+        finally:
+            conn.close()
         return 0
 
     if args.cmd == "serve":
@@ -257,6 +324,56 @@ def main(argv=None) -> int:
                 "publications": state["publications"],
                 "stats": state["stats"],
             }, indent=2))
+            return 0
+
+        # ---- privacy budget handlers -------------------------------------
+        if args.cmd == "budget-policy":
+            print(json.dumps(budget.add_policy_revision(
+                conn, args.daily_quota), indent=2))
+            return 0
+
+        if args.cmd == "budget-token":
+            r = budget.issue_token(conn, args.tenant, args.label)
+            print(json.dumps(r, indent=2))
+            print("token (store it now, it is not recoverable): " + r["token"])
+            return 0
+
+        if args.cmd == "budget-revoke":
+            print(json.dumps(budget.revoke_token(conn, args.token_id),
+                             indent=2))
+            return 0
+
+        if args.cmd == "budget-topup":
+            print(json.dumps(budget.topup(conn, args.tenant, args.amount,
+                                          args.note), indent=2))
+            return 0
+
+        if args.cmd == "budget-freeze":
+            print(json.dumps(budget.freeze_tenant(conn, args.tenant),
+                             indent=2))
+            return 0
+
+        if args.cmd == "budget-unfreeze":
+            print(json.dumps(budget.unfreeze_tenant(conn, args.tenant),
+                             indent=2))
+            return 0
+
+        if args.cmd == "budget-status":
+            ws = budget.parse_window(args.window) if args.window else None
+            print(json.dumps(budget.admin_status(conn, args.tenant, ws),
+                             indent=2))
+            return 0
+
+        if args.cmd == "budget-export":
+            # the auditor opens the database independently and READ-ONLY
+            now = attest.parse_ts(args.now) if args.now else None
+            doc = budgetaudit.export_file(
+                args.db, args.key, args.out, as_of=args.as_of,
+                previous_path=args.previous, now=now,
+                overwrite=args.overwrite)
+            print(f"exported budget {doc['budget_id']} -> {args.out}"
+                  f" (windows {len(doc['windows'])},"
+                  f" last_event_seq {doc['last_event_seq']})")
             return 0
 
         # ---- provenance ledger handlers --------------------------------
@@ -368,8 +485,15 @@ def main(argv=None) -> int:
     except ledger.LedgerError as exc:
         print(f"FAIL: {exc}", file=sys.stderr)
         return 1
+    except budget.BudgetError as exc:
+        print(f"FAIL: {exc}", file=sys.stderr)
+        return 1
+    except budgetaudit.BudgetAuditError as exc:
+        print(f"FAIL: {exc}", file=sys.stderr)
+        return 1
     finally:
-        conn.close()
+        if conn is not None:
+            conn.close()
     return 1  # pragma: no cover
 
 

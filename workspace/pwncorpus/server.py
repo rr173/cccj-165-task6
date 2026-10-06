@@ -13,7 +13,7 @@ import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-from . import core, db
+from . import budget, core, db
 
 MAX_BODY = 256 * 1024 * 1024  # 256 MiB request cap
 
@@ -85,6 +85,30 @@ def make_server(db_path: str, host: str, port: int) -> ThreadingHTTPServer:
                 return None
             return row
 
+        def _require_admin(self, conn):
+            """Budget admin routes: a VALID token of a different kind (e.g. a
+            budget query token) is 403, never mistaken for missing auth."""
+            row = self._token(conn)
+            if row is None:
+                # still a valid budget QUERY token? then it's a scope problem
+                auth = self.headers.get("Authorization", "")
+                raw = auth[7:].strip() if auth.startswith("Bearer ") else None
+                if raw:
+                    h = hashlib.sha256(raw.encode()).hexdigest()
+                    brows = conn.execute(
+                        "SELECT 1 FROM budget_tokens WHERE token_sha256=?",
+                        (h,)).fetchall()
+                    if brows:
+                        self._error(403, "token lacks required scope"
+                                         " 'budget-admin'")
+                        return None
+                self._error(401, "missing or invalid token")
+                return None
+            if "budget-admin" not in row["scopes"].split(","):
+                self._error(403, "token lacks required scope 'budget-admin'")
+                return None
+            return row
+
         # -- routing -------------------------------------------------------
         def do_GET(self):
             path = urlparse(self.path).path
@@ -96,6 +120,22 @@ def make_server(db_path: str, host: str, port: int) -> ThreadingHTTPServer:
                 m = re.fullmatch(r"/api/range/([^/]+)", path)
                 if m:
                     return self._range(conn, m.group(1))
+                m = re.fullmatch(r"/api/budget/tenants/([^/]+)/status", path)
+                if m:
+                    if not self._require_admin(conn):
+                        return
+                    qs = parse_qs(urlparse(self.path).query)
+                    ws = budget.parse_window(qs.get("window", [None])[0]) \
+                        if qs.get("window", [None])[0] else None
+                    return self._json(
+                        200, budget.admin_status(conn, m.group(1), ws))
+                if path == "/api/budget/status":
+                    if not self._require_admin(conn):
+                        return
+                    qs = parse_qs(urlparse(self.path).query)
+                    ws = budget.parse_window(qs.get("window", [None])[0]) \
+                        if qs.get("window", [None])[0] else None
+                    return self._json(200, budget.admin_status(conn, None, ws))
                 if path == "/api/publications":
                     if not self._require(conn, "publish"):
                         return
@@ -115,6 +155,8 @@ def make_server(db_path: str, host: str, port: int) -> ThreadingHTTPServer:
                     return self._review_page(conn)
                 return self._error(404, "not found")
             except core.CorpusError as exc:
+                return self._error(400, str(exc))
+            except budget.BudgetError as exc:
                 return self._error(400, str(exc))
             except BrokenPipeError:  # client went away
                 pass
@@ -165,6 +207,37 @@ def make_server(db_path: str, host: str, port: int) -> ThreadingHTTPServer:
                     return self._review_activate(conn)
                 if path == "/review/refresh":
                     return self._review_refresh(conn)
+                # ---- per-caller privacy budget administration -------------
+                if path == "/api/budget/tenants/tokens":
+                    if not self._require_admin(conn):
+                        return
+                    payload = self._body_json()
+                    return self._json(201, budget.issue_token(
+                        conn, payload.get("tenant_id"), payload.get("label")))
+                m = re.fullmatch(r"/api/budget/tenants/([^/]+)/topup", path)
+                if m:
+                    if not self._require_admin(conn):
+                        return
+                    payload = self._body_json()
+                    return self._json(200, budget.topup(
+                        conn, m.group(1), int(payload.get("amount", 0)),
+                        str(payload.get("note", ""))))
+                m = re.fullmatch(r"/api/budget/tenants/([^/]+)/freeze", path)
+                if m:
+                    if not self._require_admin(conn):
+                        return
+                    return self._json(200, budget.freeze_tenant(conn, m.group(1)))
+                m = re.fullmatch(r"/api/budget/tenants/([^/]+)/unfreeze", path)
+                if m:
+                    if not self._require_admin(conn):
+                        return
+                    return self._json(200,
+                                      budget.unfreeze_tenant(conn, m.group(1)))
+                m = re.fullmatch(r"/api/budget/tokens/([^/]+)/revoke", path)
+                if m:
+                    if not self._require_admin(conn):
+                        return
+                    return self._json(200, budget.revoke_token(conn, m.group(1)))
                 return self._error(404, "not found")
             except core.NotFound as exc:
                 return self._error(404, str(exc))
@@ -172,6 +245,10 @@ def make_server(db_path: str, host: str, port: int) -> ThreadingHTTPServer:
                 return self._error(409, str(exc))
             except core.CorpusError as exc:
                 return self._error(400, str(exc))
+            except budget.BudgetError as exc:
+                return self._error(400, str(exc))
+            except (TypeError, ValueError):
+                return self._error(400, "invalid numeric parameter")
             except BrokenPipeError:
                 pass
             finally:
@@ -179,6 +256,44 @@ def make_server(db_path: str, host: str, port: int) -> ThreadingHTTPServer:
 
         # -- handlers ------------------------------------------------------
         def _range(self, conn, prefix):
+            # When the privacy-budget module is enabled every range read is
+            # gated by a per-caller daily budget. When it is not initialised
+            # the endpoint stays fully anonymous (existing behaviour).
+            if budget.is_initialised(conn):
+                auth = self.headers.get("Authorization", "")
+                raw = []
+                if auth.startswith("Bearer "):
+                    raw = [t.strip() for t in auth[len("Bearer "):].split(",")
+                           if t.strip()]
+                try:
+                    result = budget.consume(
+                        conn, raw, prefix,
+                        idem_key=self.headers.get("Idempotency-Key"))
+                except budget.BudgetAuth:
+                    return self._error(401, "missing or invalid budget token")
+                except budget.NoActivePublication:
+                    return self._error(503, "no active publication")
+                bhdr = {
+                    "X-Budget-Tenant": result["tenant_id"],
+                    "X-Budget-Remaining": str(result["remaining_after"]),
+                    "X-Budget-Policy-Revision": str(result["policy_revision"]),
+                    "X-Corpus-Version": str(result["version"]),
+                }
+                if result["status"] == "denied":
+                    # Identifiable only by the caller's own state; the body
+                    # never states whether the prefix bucket exists.
+                    if result["http_result"] == 429:
+                        bhdr["Retry-After"] = str(budget.seconds_until_next_window(
+                            result["window_start"]))
+                    return self._json(result["http_result"],
+                                      {"error": result["reason"]}, headers=bhdr)
+                if result["http_result"] == 404:
+                    return self._json(404, {"error": "prefix not found"},
+                                      headers=bhdr)
+                bhdr["Cache-Control"] = "no-store"
+                return self._send(200, result["body"],
+                                  "text/plain; charset=utf-8", bhdr)
+
             version, body = core.query_range(conn, prefix)
             hdr = {"X-Corpus-Version": str(version)} if version else {}
             if version is None:

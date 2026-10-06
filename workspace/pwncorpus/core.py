@@ -103,7 +103,7 @@ def _bump_corpus_state(conn) -> None:
 # Auth tokens
 # --------------------------------------------------------------------------
 
-SCOPES = ("ingest", "retract", "publish")
+SCOPES = ("ingest", "retract", "publish", "budget-admin")
 
 
 def create_token(conn, label: str, scopes) -> str:

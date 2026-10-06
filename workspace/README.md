@@ -226,11 +226,94 @@ python3 -m pwncorpus.attest check  snap.json --prefix ABCDE
 - **从最后链项继续**：`ledger-replay --intents claims.jsonl` 批量追加；已在链上的声明跳过为 duplicate，崩溃后用同一文件重放即从断点继续。
 - **并行写入不分叉**：写事务 `BEGIN IMMEDIATE` 串行化，并以单行 `ledger_head` 的**条件更新**（`WHERE head_seq/head_hash = 所观察的前驱`）做原子 compare-and-set。SQLite WAL 下排队等待写锁的连接可能持有等待前的读快照（即使已拿到写锁）；CAS 影响 0 行即暴露陈旧快照，回滚重试，哈希链因此永不分叉。
 
+## 按调用方隔离的每日隐私预算（privacy budget）
+
+在匿名 `/api/range` 查询之外，另有一套**按调用方（tenant）隔离、按 UTC 日滚动**的隐私预算，跨越四个边界工作：HTTP 服务、持久化 SQLite、管理入口与一个**断网隔离审计程序**。未运行 `budget-init` 时 `/api/range` 完全保持原有匿名行为；初始化后每次前缀读取都必须携带查询令牌并消耗一次额度。
+
+### 六字段预算桶
+
+预算桶表**只有六个字段**（其余信息全部在独立的表中）：
+
+| 字段 | 含义 |
+|---|---|
+| `tenant_id` | 调用方编号（与被查询内容无关） |
+| `window_start` | UTC 日历日 00:00 的 unix 秒 |
+| `remaining` | 当日剩余额度，`CHECK(remaining >= 0)` 永不为负 |
+| `spent` | 当日已扣减次数 |
+| `frozen` | 该（调用方, 窗口）是否冻结 |
+| `policy_revision` | 播种该桶时生效的不可变策略版本号 |
+
+- **扣减与正文读取同一原子事务**：`BEGIN IMMEDIATE` 内完成鉴权 → 幂等 → 选最严租户 → 条件扣减（`UPDATE ... SET remaining=remaining-1 WHERE remaining>0 AND frozen=0`）→ 同事务读版本指针与桶行 → 写事件 → 提交。不存在"扣了没给/给了没扣"；提交前崩溃整体回滚，无负数余额、无重复扣减、无半条冻结记录。
+- **并行不双扣、不绕限**：写锁串行化 + 条件 UPDATE 影响行数校验；高倍并发下恰好只成功 `quota` 次。
+- **读不存在的桶也扣一次**（真实读取，记为 `not_found`）；但**无活跃版本（503）不扣费**。
+- **冻结**：单事务翻转租户标志与当前窗口桶标志并写管理日志；冻结期间任何请求都拿不到正文也不扣费，解冻后恢复；冻结跟随租户进入新 UTC 窗口，过去窗口标志永不改写。
+- **两枚令牌按更严者处理**：`Authorization: Bearer <t1>, <t2>`；冻结 > 已耗尽 > 剩余更少，只对最严租户扣一次。
+- **撤销与消费先到先得**：共用写锁，顺序即提交顺序；已识别但撤销的令牌明确返回 `token_revoked`(403)，完全陌生的令牌是 401（不建立任何调用方状态）。
+- **UTC 日历窗口**：一律按 UTC 午夜滚动，与宿主机时区无关；跨日得到按当时策略播种的新桶。
+- **策略变化不改写历史**：新默认额度只追加一行不可变策略版本，仅影响之后的窗口；旧审计材料的每个窗口绑定其原始版本号，新策略无法覆盖旧余额复算。
+
+### 管理入口（需 `budget-admin` 作用域）
+
+```bash
+export PYTHONPATH=/workspace
+python3 -m pwncorpus.cli --db corpus.db budget-init --key budget.key --daily-quota 100
+python3 -m pwncorpus.cli --db corpus.db token --label budgetops --scopes budget-admin
+python3 -m pwncorpus.cli --db corpus.db budget-token    --tenant svc-7 --label ci
+python3 -m pwncorpus.cli --db corpus.db budget-topup    --tenant svc-7 --amount 50 --note "surge"
+python3 -m pwncorpus.cli --db corpus.db budget-freeze   --tenant svc-7
+python3 -m pwncorpus.cli --db corpus.db budget-unfreeze --tenant svc-7
+python3 -m pwncorpus.cli --db corpus.db budget-revoke   --token-id btid_xxxxxxxx
+python3 -m pwncorpus.cli --db corpus.db budget-policy   --daily-quota 200  # 只影响之后的新窗口
+python3 -m pwncorpus.cli --db corpus.db budget-status   [--tenant svc-7] [--window 2026-10-06]
+```
+
+HTTP 管理端点：`POST /api/budget/tenants/tokens`、`/api/budget/tenants/{t}/topup|freeze|unfreeze`、`POST /api/budget/tokens/{id}/revoke`、`GET /api/budget/status` 与 `/api/budget/tenants/{t}/status`。**管理端计数与审计导出共用同一聚合函数，逐项相加必然一致。**
+
+### 查询响应隔离语义
+
+```
+GET /api/range/{prefix}   Authorization: Bearer <查询令牌>[, <第二枚>]
+200 正文（X-Budget-Tenant / -Remaining / -Policy-Revision / X-Corpus-Version）
+404 桶不存在（仍扣一次）   429 budget_exhausted（带 Retry-After）
+403 frozen / token_revoked   401 未识别令牌（不泄露桶信息）   503 无活跃版本（不扣费）
+```
+
+耗尽/冻结响应**不区分桶是否存在**（存在与不存在的前缀返回相同状态/错误码/响应体），响应头只回调用方自己的编号与余额，绝不携带其他调用方或被查内容的状态。`Idempotency-Key` 支持重复请求返回原始结果且只扣一次（并行同键也只一次），键与租户绑定。
+
+### 三个边界：导出 → 断网校验
+
+```bash
+# 独立审计进程（只读打开 DB；先做桶表 vs 事件/追加流水的内部一致性交叉校验）
+python3 -m pwncorpus.budgetaudit verify --db corpus.db
+python3 -m pwncorpus.budgetaudit export --db corpus.db --key budget.key \
+    --out budget-export.json [--as-of 2026-10-01T00:00:00+00:00] \
+    [--previous prev.json] [--overwrite]
+
+# 断网侧（budgetverify 不导入 sqlite3；移走 corpus.db 照常工作）
+python3 -m pwncorpus.budgetverify verify budget-export.json
+python3 -m pwncorpus.budgetverify daily budget-export.json --tenant svc-7 --date 2026-10-06
+python3 -m pwncorpus.budgetverify check  budget-export.json --tenant svc-7 --date 2026-10-06 --nth 150
+```
+
+导出物是单个 Ed25519 签名 JSON，**只含**调用方编号、UTC 窗口、策略版本、扣减次数、失败原因计数（`budget_exhausted/frozen/token_revoked`）与追加额度；字段白名单严格校验，多余字段（如偷塞前缀）即失败。校验顺序：结构/白名单 → 自哈希 → genesis 签名 → 策略版本自 1 无间隙 → 逐窗口算术且非负。脱离服务即可复算：
+
+```
+remaining = policy[revision].daily_quota + Σgrants.amount − deductions
+```
+
+`check --nth N`：`within_budget`（容量内且已记录）/ `within_budget_unrecorded`（容量内但无此扣减）/ `over_budget` / `no_record`。
+
+- **篡改即失败**：改数字 → 自哈希不符；重哈希但无 genesis 私钥 → 签名不符；伪造整窗使扣减 > 配额+追加 → 余额为负被拒；旧窗口挂到不存在的新版本号 → 被拒；钉扎公钥不符 → 被拒。
+- **库外篡改在导出时被拦**：直接改库使桶表与事件流不一致（如 `spent` 多 1），审计明确报 `disagrees`，绝不粉饰。
+- **旧材料不可被覆盖**：默认拒绝用不同材料覆盖同一路径；`--previous` 要求前一份可验真且事件序号不更新；旧时点导出不能挂在更新导出之后。
+- 事件表追加式，只记 `tenant/window/result/timestamp`，不含前缀、后缀、指纹或原始口令（测试对导出文件做敏感子串断言）。
+
 ## 测试
 
 ```bash
 python3 -m unittest discover -s tests -v
 ```
 
-87 个用例覆盖：原有 46 个（摄取/发布/导出/增量，行为不变），以及责任账本：链项哈希与 prev_hash 链接、来源注册与验签、伪造签名与未注册来源拒绝、只能撤回/纠错本人提交、撤回理由与摘要绑定、重复提交/幂等键返回原记录、双撤回幂等、链项删除即断链、存储哈希篡改检测、`--expect-head` 并行冲突、断点重放跳过已追加项、8 线程同声明唯一胜出、不同声明无间隙串行、高并发下链永不分叉（多轮回归）、纠错先于/后于撤回的标记、快照自哈希/genesis 签名/TTL 过期、`--as-of` 时间点截断、责任记录与链项签名篡改检测、缺失链项、genesis 公钥钉扎不符、旧快照不得覆盖较新状态（同 head 可续期）、错误 genesis 密钥拒绝、离线核验的提交/撤回时间/纠错先后判定、仅前缀查询不泄露其他指纹、摘要不符与来源权限的明确失败、失败信息不含桶内容、以及三边界全部经真实子进程（CLI 写入→独立 audit 导出→无数据库 attest 核验，含移走 DB 后仍可核验），并验证账本与现有摄取/构建/激活/导出流水线共存不变。
+146 个用例：原有 87 个（摄取/发布/导出/增量 + 责任账本，行为不变），新增 59 个隐私预算用例——首次请求建桶与事务前后余额、不存在桶 404 仍扣费、无活跃版本不扣费、幂等键重复/并行同键/跨租户绑定、高并发恰好用尽不双扣、多租户独立、两令牌更严者（冻结/耗尽/剩余）治理、耗尽响应不区分桶存在、原始 SQL 也无法做成负余额、追加提额、冻结/解冻与跨日跟随、冻结/扣减提交前崩溃回滚（无半条冻结、无重复扣减）、撤销幂等与撤销-消费多轮 FCFS、UTC（非本机时区）窗口与跨日恢复、策略新版本不改旧窗口、重启后余额恢复（含真实子进程重新发起查询而非探活）、管理计数与导出逐项一致、导出物字段白名单与敏感子串断言、移走 DB 后断网复算余额/判定第 N 次请求、伪造窗口/篡改数字/重哈希伪造签名/钉扎公钥不符/多余字段/版本号改写拒绝、导出链接与旧材料保护、`--as-of` 时点导出、库外篡改被审计拒绝，以及四边界经真实子进程（CLI 管理 → 独立 `budgetaudit` 只读导出 → 无数据库 `budgetverify` 校验）。
+
 
